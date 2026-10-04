@@ -12,6 +12,8 @@ from contextlib import redirect_stdout
 
 import chromadb
 import streamlit as st
+from chromadb.errors import NotFoundError
+from openai import APIConnectionError
 
 import config
 import rag
@@ -26,35 +28,66 @@ def db_client():
     return chromadb.PersistentClient(path=config.DB_DIR)
 
 
-def index_stats():
-    """(chunk_count, source filenames), or None when nothing has been ingested."""
+def index_status():
+    """("ok"|"missing"|"empty"|"error", chunk count, source filenames, message).
+
+    A failure to *read* the index is reported as itself. Reporting it as "no index"
+    would blame docs/ for something that has nothing to do with the files there.
+    """
     try:
         collection = db_client().get_collection(config.COLLECTION)
         count = collection.count()
-    except Exception:
-        return None
-    if not count:
-        return 0, []
-    metas = collection.get(include=["metadatas"])["metadatas"]
-    return count, sorted({m["source"] for m in metas})
+        if not count:
+            return "empty", 0, [], ""
+        metas = collection.get(include=["metadatas"])["metadatas"]
+        return "ok", count, sorted({m["source"] for m in metas}), ""
+    except NotFoundError:
+        return "missing", 0, [], ""
+    except Exception as exc:
+        return "error", 0, [], f"{type(exc).__name__}: {exc}"
+
+
+def explain(exc):
+    """Readable text for the usual failure: the model server is not running."""
+    if isinstance(exc, APIConnectionError):
+        return (f"Could not reach the model server at {config.OLLAMA_URL}. "
+                f"Start it with `ollama serve`, then try again.")
+    return f"{type(exc).__name__}: {exc}"
 
 
 def rebuild_index():
-    """Run ingest.py in-process and return what it printed."""
+    """Run ingest.py in-process. Returns (what it printed, error message or None).
+
+    Embedding happens before ingest.py touches Chroma, so a failure here leaves
+    the existing index exactly as it was.
+    """
     import ingest
 
     printed = io.StringIO()
-    with redirect_stdout(printed):
-        ingest.main()
-    rag._collection = None          # the old collection object was deleted by ingest
-    return printed.getvalue()
+    try:
+        with redirect_stdout(printed):
+            ingest.main()
+    except BaseException as exc:          # ingest.py uses SystemExit for 'no docs'
+        return printed.getvalue(), explain(exc)
+    rag._collection = None                # the old collection object was deleted by ingest
+    return printed.getvalue(), None
+
+
+def doc_files():
+    """The files ingest.py would pick up, so the UI can say what it can see."""
+    try:
+        return sorted(p.name for p in config.DOCS_DIR.iterdir()
+                      if p.suffix.lower() in (".md", ".txt", ".pdf"))
+    except OSError:
+        return []
 
 
 def chunk_texts(ids):
     """Chunk id -> chunk text, read straight from Chroma (no embedding needed)."""
     try:
-        got = rag.get_collection().get(ids=ids, include=["documents"])
-    except (Exception, SystemExit):
+        got = db_client().get_collection(config.COLLECTION).get(ids=ids,
+                                                                include=["documents"])
+    except Exception:
         return {}
     return dict(zip(got["ids"], got["documents"]))
 
@@ -117,20 +150,21 @@ with st.sidebar:
     if st.button("Rebuild index", use_container_width=True,
                  help="Re-reads docs/, re-chunks and re-embeds everything."):
         with st.spinner("Embedding chunks — this is the slow part…"):
-            try:
-                st.session_state.ingest_log = rebuild_index()
-            except BaseException as exc:          # ingest.py uses SystemExit for 'no docs'
-                st.session_state.ingest_log = f"Failed: {exc}"
+            st.session_state.ingest_log, st.session_state.ingest_error = rebuild_index()
 
-    stats = index_stats()
-    has_index = bool(stats and stats[0])
+    state, count, files, message = index_status()
+    has_index = state == "ok"
     with status_slot.container():
-        if not has_index:
-            st.warning("No index yet.")
+        if has_index:
+            st.metric("chunks indexed", count)
+            st.caption(" · ".join(files))
+        elif state == "error":
+            st.error(f"Could not read the index: {message}")
         else:
-            st.metric("chunks indexed", stats[0])
-            st.caption(" · ".join(stats[1]))
+            st.warning("No index yet." if state == "missing" else "The index is empty.")
 
+    if st.session_state.get("ingest_error"):
+        st.error(st.session_state.ingest_error)
     if st.session_state.get("ingest_log"):
         st.code(st.session_state.ingest_log.strip(), language=None)
 
@@ -172,8 +206,15 @@ for message in st.session_state.messages:
             render_details(message["result"], show_debug)
 
 if not has_index:
-    st.info("Put `.md`, `.txt` or `.pdf` files in `docs/`, then press "
-            "**Rebuild index** in the sidebar.")
+    found = doc_files()
+    if found:
+        # The files are there; they just have not been embedded yet. Say that,
+        # rather than telling someone to add files they can see in the folder.
+        st.info(f"`docs/` has {len(found)} file(s) ready to index "
+                f"({', '.join(found)}). Press **Rebuild index** in the sidebar.")
+    else:
+        st.info(f"No `.md`, `.txt` or `.pdf` files in `{config.DOCS_DIR}/`. "
+                f"Add some, then press **Rebuild index** in the sidebar.")
 
 question = st.chat_input("Ask about your documents", disabled=not has_index)
 
@@ -187,8 +228,7 @@ if question:
             with st.spinner("Searching documents…"):
                 result = rag.answer(question)
         except Exception as exc:
-            error = (f"Could not reach the model server at {config.OLLAMA_URL}.\n\n"
-                     f"Start it with `ollama serve`, then ask again.\n\n`{exc}`")
+            error = explain(exc)
             st.error(error)
             st.session_state.messages.append({"role": "assistant", "content": error})
         else:
