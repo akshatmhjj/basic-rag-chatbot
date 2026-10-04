@@ -22,10 +22,15 @@ embeddings) and **Chroma** (vector database).
 | 1 | `ollama pull llama3.2` and `ollama pull nomic-embed-text` | Downloads the chat model and the embedding model | Once |
 | 2 | `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt` | Creates the Python environment and installs packages | Once |
 | 3 | `python ingest.py` | Reads `docs/`, chunks, embeds and saves to `chroma_db/` | Once, and again whenever docs or chunk settings change |
-| 4 | `python app.py` | Opens the chat | Whenever you want to ask questions |
+| 4 | `streamlit run streamlit_app.py` | Opens the chat in the browser (recommended) | Whenever you want to ask questions |
+| 4b | `python app.py` | The same chat in the terminal | Same thing, no browser |
 | 5 | `python eval.py` | Scores the bot on `eval_set.jsonl` | After every change you want to measure |
 
-Inside the chat, type `:debug` to show similarity scores and retrieved chunks, and `:quit` to exit.
+The browser UI opens at <http://localhost:8501>. Both front ends call the same
+`rag.answer()`, so they always behave identically.
+
+In the terminal chat, type `:debug` to show similarity scores and retrieved chunks, and
+`:quit` to exit. In the browser, the sidebar does the same with **Show retrieved chunks**.
 
 ---
 
@@ -78,9 +83,10 @@ rag-chatbot/
 ├── ingest.py             builds the index
 ├── rag.py                answers one question
 ├── app.py                command-line chat
+├── streamlit_app.py      browser chat (same core)
 ├── eval.py               scores the bot
 ├── eval_set.jsonl        test questions
-├── requirements.txt      openai, chromadb, pypdf
+├── requirements.txt      openai, chromadb, pypdf, streamlit
 ├── chroma_db/            created by ingest.py (git-ignored)
 └── logs/                 created on first question (git-ignored)
 ```
@@ -115,6 +121,13 @@ Switching to Gemini or Groq means changing `config.py`, because every other file
 
 **`app.py`** is a `while` loop around `rag.answer()`. Debug mode prints the best similarity,
 which guard refused, token counts and the IDs of the retrieved chunks.
+
+**`streamlit_app.py`** is the browser front end, and it only draws things: every answer still
+comes from `rag.answer()`. The sidebar reports how many chunks are indexed and which files they
+came from, rebuilds the index without leaving the page (it calls `ingest.main()`), exposes
+`TOP_K` and `MIN_SIMILARITY` as live sliders so thresholds can be felt rather than guessed, and
+lists the last few logged questions. Each answer carries its source files underneath, and with
+**Show retrieved chunks** on, every retrieved chunk is shown with its similarity and text.
 
 **`eval.py`** runs every question in `eval_set.jsonl` through the real pipeline, prints
 PASS/FAIL per question, prints a scorecard, details each failure, and appends a summary line
@@ -263,4 +276,7 @@ larger model (`llama3.1:8b` or Gemini Flash) using the eval.
 - **No chat memory:** each question is independent; follow-ups need chat history and query rewriting.
 - **Dense retrieval only:** hybrid search (BM25 + embeddings) would help with exact terms like error codes.
 - **Scanned PDFs** have no text layer and are skipped (would need OCR).
-- **CLI only:** a Streamlit UI is planned.
+- **No conversation memory in the UI either:** the browser keeps the transcript on screen, but
+  each question is still answered on its own, exactly as in the CLI.
+- **One user at a time:** the Streamlit app is meant to run locally against a local Ollama; the
+  sliders change module-level settings for the running process.
