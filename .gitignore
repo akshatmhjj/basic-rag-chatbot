@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Generated vector database and logs
+chroma_db/
+logs/*.jsonl
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
